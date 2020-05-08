@@ -144,10 +144,8 @@ private val NONE = Symbol("NONE")
 @SharedImmutable
 private val PENDING = Symbol("PENDING")
 
-private const val INITIAL_SIZE = 2 // optimized for just a few collectors
-
 // StateFlow slots are allocated for its collectors
-private class StateFlowSlot {
+private class StateFlowSlot : AbstractHotFlowSlot() {
     /**
      * Each slot can have one of the following states:
      *
@@ -161,14 +159,14 @@ private class StateFlowSlot {
      */
     private val _state = atomic<Any?>(null)
 
-    fun allocate(): Boolean {
+    override fun allocate(): Boolean {
         // No need for atomic check & update here, since allocated happens under StateFlow lock
         if (_state.value != null) return false // not free
         _state.value = NONE // allocated
         return true
     }
 
-    fun free() {
+    override fun free() {
         _state.value = null // free now
     }
 
@@ -207,19 +205,16 @@ private class StateFlowSlot {
     }
 }
 
-private class StateFlowImpl<T>(initialValue: Any) : SynchronizedObject(), MutableStateFlow<T>, FusibleFlow<T> {
+private class StateFlowImpl<T>(initialValue: Any) : AbstractHotFlow<StateFlowSlot>(), MutableStateFlow<T>, FusibleFlow<T> {
     private val _state = atomic(initialValue) // T | NULL
     private var sequence = 0 // serializes updates, value update is in process when sequence is odd
-    private var slots = arrayOfNulls<StateFlowSlot?>(INITIAL_SIZE)
-    private var nSlots = 0 // number of allocated (!free) slots
-    private var nextIndex = 0 // oracle for the next free slot index
 
     @Suppress("UNCHECKED_CAST")
     public override var value: T
         get() = NULL.unbox(_state.value)
         set(value) {
             var curSequence = 0
-            var curSlots: Array<StateFlowSlot?> = this.slots // benign race, we will not use it
+            var curSlots: Array<StateFlowSlot?>? = this.slots // benign race, we will not use it
             val newState = value ?: NULL
             synchronized(this) {
                 val oldState = _state.value
@@ -244,8 +239,8 @@ private class StateFlowImpl<T>(initialValue: Any) : SynchronizedObject(), Mutabl
              */
             while (true) {
                 // Benign race on element read from array
-                for (col in curSlots) {
-                    col?.makePending()
+                curSlots?.forEach {
+                    it?.makePending()
                 }
                 // check if the value was updated again while we were updating the old one
                 synchronized(this) {
@@ -284,26 +279,7 @@ private class StateFlowImpl<T>(initialValue: Any) : SynchronizedObject(), Mutabl
         }
     }
 
-    private fun allocateSlot(): StateFlowSlot = synchronized(this) {
-        val size = slots.size
-        if (nSlots >= size) slots = slots.copyOf(2 * size)
-        var index = nextIndex
-        var slot: StateFlowSlot
-        while (true) {
-            slot = slots[index] ?: StateFlowSlot().also { slots[index] = it }
-            index++
-            if (index >= slots.size) index = 0
-            if (slot.allocate()) break // break when found and allocated free slot
-        }
-        nextIndex = index
-        nSlots++
-        slot
-    }
-
-    private fun freeSlot(slot: StateFlowSlot): Unit = synchronized(this) {
-        slot.free()
-        nSlots--
-    }
+    override fun createSlot() = StateFlowSlot()
 
     override fun fuse(context: CoroutineContext, capacity: Int): FusibleFlow<T> {
         // context is irrelevant for state flow and it is always conflated
